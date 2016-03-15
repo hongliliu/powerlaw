@@ -136,6 +136,7 @@ class Fit(object):
                                         'lognormal': Lognormal,
                                         'exponential': Exponential,
                                         'truncated_power_law': Truncated_Power_Law,
+                                        'schechter' : Schechter,
                                         'stretched_exponential': Stretched_Exponential,
                                         'lognormal_positive': Lognormal_Positive,
                                         }
@@ -1442,6 +1443,99 @@ class Truncated_Power_Law(Distribution):
         from numpy import array
         return array(list(map(helper, r)))
 
+class Schechter(Distribution):
+    def parameters(self, params):
+#        self.parameter1 = self.alpha
+#        self.parameter1_name = 'alpha'
+        self.Lambda = params[0]
+        self.parameter1 = self.Lambda
+        self.parameter1_name = 'lambda'
+
+    @property
+    def name(self):
+        return "schechter"
+
+    def _initial_parameters(self, data):
+        from numpy import log, sum, mean
+        Lambda = 1/mean(data)
+        return (Lambda)
+
+    def _in_standard_parameter_range(self):
+        return self.Lambda>0 and 2>1
+
+    def _cdf_base_function(self, x):
+        from mpmath import gammainc
+        from numpy import vectorize
+        gammainc = vectorize(gammainc)
+
+        CDF = ( (gammainc(-1,self.Lambda*x)).astype('float') /
+                self.Lambda**(1-2)
+                    )
+        CDF = 1 -CDF
+        return CDF
+
+    def _pdf_base_function(self, x):
+        from numpy import exp
+        return x**(-2) * exp(-self.Lambda * x)
+
+    @property
+    def _pdf_continuous_normalizer(self):
+        from mpmath import gammainc
+        C = ( self.Lambda**(-1) /
+                float(gammainc(-1,self.Lambda*self.xmin)))
+        return C
+
+    @property
+    def _pdf_discrete_normalizer(self):
+        if 0:
+            return False
+        from mpmath import lerchphi
+        from mpmath import exp # faster /here/ than numpy.exp
+        C = ( float(exp(self.xmin * self.Lambda) /
+            lerchphi(exp(-self.Lambda), 2, self.xmin)) )
+        if self.xmax:
+            Cxmax = ( float(exp(self.xmax * self.Lambda) /
+                lerchphi(exp(-self.Lambda), 2, self.xmax)) )
+            C = 1.0/C - 1.0/Cxmax
+            C = 1.0/C
+        return C
+
+    def pdf(self, data=None):
+        if data is None and hasattr(self, 'parent_Fit'):
+            data = self.parent_Fit.data
+        if not self.discrete and self.in_range() and False:
+            data = trim_to_range(data, xmin=self.xmin, xmax=self.xmax)
+            from numpy import exp
+            from mpmath import gammainc
+#        likelihoods = (data**-alpha)*exp(-Lambda*data)*\
+#                (Lambda**(1-alpha))/\
+#                float(gammainc(1-alpha,Lambda*xmin))
+            likelihoods = ( self.Lambda**(1-2) /
+                    (data**2 *
+                            exp(self.Lambda*data) *
+                            gammainc(-1,self.Lambda*self.xmin)
+                            ).astype(float)
+                    )
+            #Simplified so as not to throw a nan from infs being divided by each other
+            from sys import float_info
+            likelihoods[likelihoods==0] = 10**float_info.min_10_exp
+        else:
+            likelihoods = Distribution.pdf(self, data)
+        return likelihoods
+
+    def _generate_random_continuous(self, r):
+        def helper(r):
+            from numpy import log
+            from numpy.random import rand
+            while 1:
+                x = self.xmin - (1/self.Lambda) * log(1-r)
+                p = ( x/self.xmin )**-2
+                if rand()<p:
+                    return x
+                r = rand()
+        from numpy import array
+        return array(list(map(helper, r)))
+
 class Lognormal(Distribution):
 
     def parameters(self, params):
@@ -2113,6 +2207,7 @@ class Distribution_Fit(object):
         param_names = {'lognormal': ('mu', 'sigma', None),
                        'exponential': ('Lambda', None, None),
                        'truncated_power_law': ('alpha', 'Lambda', None),
+                       'schechter' : ('Lambda', None, None),
                        'power_law': ('alpha', None, None),
                        'negative_binomial': ('r', 'p', None),
                        'stretched_exponential': ('Lambda', 'beta', None),
@@ -2309,6 +2404,9 @@ def distribution_fit(data, distribution='all', discrete=False, xmin=None, xmax=N
     elif distribution == 'truncated_power_law':
         from numpy import mean
         initial_parameters = [1 + n / sum(log(data / xmin)), 1 / mean(data)]
+    elif distribution == 'schechter':
+        from numpy import mean
+        initial_parameters = [1 / mean(data)]
     elif distribution == 'lognormal':
         from numpy import mean, std
         logdata = log(data)
@@ -2431,6 +2529,11 @@ def likelihood_function_generator(distribution_name, discrete=False, xmin=1, xma
         likelihood_function = lambda parameters, data:\
             truncated_power_law_likelihoods(
                 data, parameters[0], parameters[1], xmin, xmax, discrete)
+
+    elif distribution_name == 'schechter':
+        likelihood_function = lambda parameters, data:\
+            schechter_likelihoods(
+                data, parameters[0], xmin, xmax, discrete)
 
     elif distribution_name == 'lognormal':
         likelihood_function = lambda parameters, data:\
@@ -2748,6 +2851,38 @@ def truncated_power_law_likelihoods(data, alpha, Lambda, xmin, xmax=False, discr
     likelihoods[likelihoods == 0] = 10 ** float_info.min_10_exp
     return likelihoods
 
+def schechter_likelihoods(data, Lambda, xmin, xmax=False, discrete=False):
+    if Lambda < 0:
+        from numpy import tile
+        from sys import float_info
+        return tile(10 ** float_info.min_10_exp, len(data))
+    alpha = 2
+    data = data[data >= xmin]
+    if xmax:
+        data = data[data <= xmax]
+
+    from numpy import exp
+    if not discrete:
+        from mpmath import gammainc
+#        from scipy.special import gamma, gammaincc #Not NEARLY accurate enough to do the job
+#        likelihoods = (data**-alpha)*exp(-Lambda*data)*\
+#                (Lambda**(1-alpha))/\
+#                float(gammaincc(1-alpha,Lambda*xmin))
+        #Simplified so as not to throw a nan from infs being divided by each other
+        likelihoods = (Lambda ** (1 - alpha)) /\
+                      ((data ** alpha) * exp(Lambda * data) * gammainc(1 - alpha, Lambda * xmin)).astype(float)
+    if discrete:
+        if not xmax:
+            xmax = max(data)
+        if xmax:
+            from numpy import arange
+            X = arange(xmin, xmax + 1)
+            PDF = (X ** -alpha) * exp(-Lambda * X)
+            PDF = PDF / sum(PDF)
+            likelihoods = PDF[(data - xmin).astype(int)]
+    from sys import float_info
+    likelihoods[likelihoods == 0] = 10 ** float_info.min_10_exp
+    return likelihoods
 
 def lognormal_likelihoods(data, mu, sigma, xmin, xmax=False, discrete=False):
     from numpy import log
